@@ -1,66 +1,49 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
-# ======================
-# IMPORTACIONES
-# ======================
-# Dash → framework para dashboards interactivos
 from dash import Dash, dcc, html, Input, Output
-
-# Plotly → visualizaciones
 import plotly.express as px
-
-# Pandas → manejo de datos
 import pandas as pd
-
-# OS → manejo de rutas de archivos
+import numpy as np
 import os
 
 
-# ======================
-# CARGA Y PREPARACIÓN DE DATOS
-# ======================
-
-# Obtener ruta del archivo
 base_path = os.path.dirname(__file__)
 file_path = os.path.join(base_path, 'telecom_dataset_new.csv')
 
-# Leer dataset
 calls = pd.read_csv(file_path)
 
-# Convertir fechas y eliminar zona horaria (evita errores en filtros)
-calls['date'] = pd.to_datetime(calls['date']).dt.tz_localize(None)
+calls = calls.drop_duplicates()
 
-# Extraer solo la fecha (sin hora)
+calls['date'] = pd.to_datetime(calls['date']).dt.tz_localize(None)
 calls['day'] = calls['date'].dt.date
 
-# Asegurar que la columna sea booleana
-calls['internal'] = calls['internal'].astype(bool)
+# map() en lugar de astype(bool) — "False" como string se convierte a True con astype
+calls['internal'] = calls['internal'].map({'True': True, 'False': False})
 
+calls = calls.dropna(subset=['operator_id', 'internal'])
 
-# ======================
-# CREACIÓN DE LA APP
-# ======================
+calls['wait_time'] = calls['total_call_duration'] - calls['call_duration']
+
+# Calcular métricas por operador para el gráfico de eficiencia
+operator_stats = calls.groupby('operator_id').agg({
+    'calls_count': 'sum',
+    'is_missed_call': 'mean',
+    'wait_time': 'mean',
+}).reset_index()
+operator_stats = operator_stats.rename(columns={'is_missed_call': 'missed_rate'})
+operator_stats = operator_stats.sort_values('missed_rate', ascending=False)
+
 
 external_stylesheets = ['https://codepen.io/chriddyp/pen/bWLwgP.css']
 app = Dash(__name__, external_stylesheets=external_stylesheets)
 
 
-# ======================
-# DISEÑO DEL DASHBOARD (LAYOUT)
-# ======================
-
 app.layout = html.Div([
 
-    # Título principal
     html.H1("CallMeMaybe Dashboard", style={'textAlign': 'center'}),
 
-    # ======================
-    # FILTROS
-    # ======================
     html.Div([
-
-        # Dropdown para tipo de llamadas
         html.Div([
             html.Label("Tipo de llamadas"),
             dcc.Dropdown(
@@ -75,7 +58,6 @@ app.layout = html.Div([
             )
         ], style={'width': '48%'}),
 
-        # Selector de rango de fechas
         html.Div([
             html.Label("Rango de fechas"),
             dcc.DatePickerRange(
@@ -90,18 +72,12 @@ app.layout = html.Div([
 
     html.Br(),
 
-    # ======================
-    # GRÁFICOS PRINCIPALES
-    # ======================
     html.Div([
-
-        # Gráfico de duración de llamadas
         html.Div([
-            html.H4("Duración de llamadas (análisis real)"),
+            html.H4("Duración de llamadas"),
             dcc.Graph(id='hist_duration')
         ], style={'width': '48%'}),
 
-        # Gráfico de proporción internas vs externas
         html.Div([
             html.H4("Internas vs Externas"),
             dcc.Graph(id='pie_internal')
@@ -111,24 +87,27 @@ app.layout = html.Div([
 
     html.Br(),
 
-    # Gráfico de llamadas por día
     html.Div([
         html.H4("Llamadas por día"),
         dcc.Graph(id='calls_per_day')
+    ]),
+
+    html.Br(),
+
+    html.Div([
+        html.H4("Top 20 operadores por tasa de llamadas perdidas"),
+        dcc.Graph(id='operator_efficiency')
     ])
 
 ], style={'width': '85%', 'margin': 'auto'})
 
-
-# ======================
-# CALLBACK (LÓGICA DEL DASHBOARD)
-# ======================
 
 @app.callback(
     [
         Output('hist_duration', 'figure'),
         Output('pie_internal', 'figure'),
         Output('calls_per_day', 'figure'),
+        Output('operator_efficiency', 'figure'),
     ],
     [
         Input('call_type_filter', 'value'),
@@ -138,115 +117,92 @@ app.layout = html.Div([
 )
 def update_dashboard(call_type, start_date, end_date):
 
-    # ======================
-    # FILTRO POR TIPO DE LLAMADA
-    # ======================
     if call_type == 'all':
         filtered = calls.copy()
     else:
         filtered = calls[calls['direction'] == call_type]
 
-    # ======================
-    # FILTRO POR FECHAS
-    # ======================
     start_date = pd.to_datetime(start_date).tz_localize(None)
     end_date = pd.to_datetime(end_date).tz_localize(None)
 
-    filtered_dates = calls[
-        (calls['date'] >= start_date) &
-        (calls['date'] <= end_date)
+    filtered_dates = filtered[
+        (filtered['date'] >= start_date) &
+        (filtered['date'] <= end_date)
     ]
 
-    # ======================
-    # GRÁFICO 1: DURACIÓN DE LLAMADAS
-    # ======================
-
-    df = filtered.copy()
-
-    # Convertir duración de segundos a minutos
+    # Gráfico 1: Duración de llamadas
+    df = filtered_dates.copy()
     df['duration_min'] = df['call_duration'] / 60
-
-    # Eliminar outliers extremos (>60 min) para mejorar visualización
     df = df[df['duration_min'] < 60]
-
-    # Crear rangos (bins) de duración
     df['bin'] = pd.cut(df['duration_min'], bins=20)
 
-    # Calcular duración promedio por rango
     grouped = df.groupby(['bin', 'direction'])[
         'duration_min'].mean().reset_index()
-
-    # Convertir bins a string para visualización
     grouped['bin'] = grouped['bin'].astype(str)
 
-    # Crear gráfico dependiendo del filtro
     if call_type == 'all':
         fig1 = px.bar(
-            grouped,
-            x='bin',
-            y='duration_min',
-            color='direction',
+            grouped, x='bin', y='duration_min', color='direction',
             title='Duración promedio por rango de llamadas'
         )
     else:
         fig1 = px.bar(
             grouped[grouped['direction'] == call_type],
-            x='bin',
-            y='duration_min',
+            x='bin', y='duration_min',
             title='Duración promedio por rango de llamadas',
             color_discrete_sequence=['#636EFA']
         )
 
-    # Etiquetas del gráfico
     fig1.update_layout(
-        xaxis_title="Rangos de duración de llamada (minutos)",
+        xaxis_title="Rangos de duración (minutos)",
         yaxis_title="Duración promedio (minutos)",
         xaxis_tickangle=45
     )
 
-    # ======================
-    # GRÁFICO 2: PIE CHART
-    # ======================
-
-    # Conteo de llamadas internas vs externas
+    # Gráfico 2: Pie chart internas vs externas
     pie_data = filtered_dates['internal'].value_counts().reset_index()
     pie_data.columns = ['internal', 'count']
-
-    # Renombrar valores para mejor interpretación
     pie_data['internal'] = pie_data['internal'].map({
-        True: 'Interna',
-        False: 'Externa'
+        True: 'Interna', False: 'Externa'
     })
 
     fig2 = px.pie(
-        pie_data,
-        names='internal',
-        values='count',
+        pie_data, names='internal', values='count',
         title='Proporción internas vs externas'
     )
 
-    # ======================
-    # GRÁFICO 3: LLAMADAS POR DÍA
-    # ======================
-
-    # Agrupar número de llamadas por día
-    calls_day = filtered_dates.groupby(
-        'day')['calls_count'].sum().reset_index()
+    # Gráfico 3: Llamadas por día
+    calls_day = filtered_dates.groupby('day')['calls_count'].sum().reset_index()
 
     fig3 = px.bar(
-        calls_day,
-        x='day',
-        y='calls_count',
+        calls_day, x='day', y='calls_count',
         title='Número de llamadas por día'
     )
 
-    # Retornar los tres gráficos
-    return fig1, fig2, fig3
+    # Gráfico 4: Eficiencia por operador
+    op_stats = filtered_dates.groupby('operator_id').agg({
+        'calls_count': 'sum',
+        'is_missed_call': 'mean',
+        'wait_time': 'mean',
+    }).reset_index()
+    op_stats = op_stats.rename(columns={'is_missed_call': 'missed_rate'})
+    op_stats = op_stats.sort_values('missed_rate', ascending=False).head(20)
 
+    fig4 = px.bar(
+        op_stats, x='operator_id', y='missed_rate',
+        color='wait_time',
+        color_continuous_scale='RdYlGn_r',
+        title='Top 20 operadores: tasa de llamadas perdidas (color = tiempo de espera)',
+        labels={
+            'operator_id': 'Operador',
+            'missed_rate': 'Tasa de perdidas',
+            'wait_time': 'Espera promedio (seg)'
+        }
+    )
+    fig4.update_layout(xaxis_type='category')
 
-# ======================
-# EJECUCIÓN DE LA APP
-# ======================
+    return fig1, fig2, fig3, fig4
+
 
 if __name__ == '__main__':
     app.run(debug=True, port=8051, use_reloader=False)
