@@ -4,35 +4,50 @@
 from dash import Dash, dcc, html, Input, Output
 import plotly.express as px
 import pandas as pd
-import numpy as np
-import os
+from pathlib import Path
 
 
-base_path = os.path.dirname(__file__)
-file_path = os.path.join(base_path, 'telecom_dataset_new.csv')
+BASE_PATH = Path(__file__).resolve().parent
+CALLS_FILE = BASE_PATH / 'telecom_dataset_new.csv'
 
-calls = pd.read_csv(file_path)
 
-calls = calls.drop_duplicates()
+def coerce_internal(series):
+    values = series.astype('string').str.strip().str.lower()
+    return values.map({
+        'true': True,
+        'false': False,
+        '1': True,
+        '0': False,
+    }).astype('boolean')
 
-calls['date'] = pd.to_datetime(calls['date']).dt.tz_localize(None)
-calls['day'] = calls['date'].dt.date
 
-# map() en lugar de astype(bool) — "False" como string se convierte a True con astype
-calls['internal'] = calls['internal'].map({'True': True, 'False': False})
+def load_calls(file_path=CALLS_FILE):
+    calls_data = pd.read_csv(file_path).drop_duplicates()
 
-calls = calls.dropna(subset=['operator_id', 'internal'])
+    calls_data['date'] = (
+        pd.to_datetime(calls_data['date'], errors='coerce')
+        .dt.tz_localize(None)
+    )
+    calls_data['internal'] = coerce_internal(calls_data['internal'])
 
-calls['wait_time'] = calls['total_call_duration'] - calls['call_duration']
+    calls_data = calls_data.dropna(subset=['date', 'operator_id', 'internal'])
+    calls_data['operator_id'] = calls_data['operator_id'].astype('int64')
+    calls_data['internal'] = calls_data['internal'].astype(bool)
+    calls_data['wait_time'] = (
+        calls_data['total_call_duration'] - calls_data['call_duration']
+    )
+    calls_data['day'] = calls_data['date'].dt.date
 
-# Calcular métricas por operador para el gráfico de eficiencia
-operator_stats = calls.groupby('operator_id').agg({
-    'calls_count': 'sum',
-    'is_missed_call': 'mean',
-    'wait_time': 'mean',
-}).reset_index()
-operator_stats = operator_stats.rename(columns={'is_missed_call': 'missed_rate'})
-operator_stats = operator_stats.sort_values('missed_rate', ascending=False)
+    if calls_data.empty:
+        raise ValueError(
+            'No call records remain after cleaning. Check date, operator_id, '
+            'and internal columns.'
+        )
+
+    return calls_data
+
+
+calls = load_calls()
 
 
 external_stylesheets = ['https://codepen.io/chriddyp/pen/bWLwgP.css']
@@ -62,8 +77,8 @@ app.layout = html.Div([
             html.Label("Rango de fechas"),
             dcc.DatePickerRange(
                 id='date_range',
-                start_date=calls['date'].min(),
-                end_date=calls['date'].max(),
+                start_date=calls['date'].min().date().isoformat(),
+                end_date=calls['date'].max().date().isoformat(),
                 display_format='YYYY-MM-DD'
             )
         ], style={'width': '48%'})
@@ -122,12 +137,12 @@ def update_dashboard(call_type, start_date, end_date):
     else:
         filtered = calls[calls['direction'] == call_type]
 
-    start_date = pd.to_datetime(start_date).tz_localize(None)
-    end_date = pd.to_datetime(end_date).tz_localize(None)
+    start_date = pd.to_datetime(start_date)
+    end_date = pd.to_datetime(end_date) + pd.Timedelta(days=1)
 
     filtered_dates = filtered[
         (filtered['date'] >= start_date) &
-        (filtered['date'] <= end_date)
+        (filtered['date'] < end_date)
     ]
 
     # Gráfico 1: Duración de llamadas
@@ -136,7 +151,7 @@ def update_dashboard(call_type, start_date, end_date):
     df = df[df['duration_min'] < 60]
     df['bin'] = pd.cut(df['duration_min'], bins=20)
 
-    grouped = df.groupby(['bin', 'direction'])[
+    grouped = df.groupby(['bin', 'direction'], observed=True)[
         'duration_min'].mean().reset_index()
     grouped['bin'] = grouped['bin'].astype(str)
 
